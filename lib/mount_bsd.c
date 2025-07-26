@@ -74,6 +74,7 @@ static const struct fuse_opt fuse_mount_opts[] = {
 	FUSE_DUAL_OPT_KEY("automounted",	KEY_KERN),
 	/* options supported under both Linux and FBSD */
 	FUSE_DUAL_OPT_KEY("allow_other",	KEY_KERN),
+	FUSE_DUAL_OPT_KEY("auto_unmount",	KEY_KERN),
 	FUSE_DUAL_OPT_KEY("default_permissions",KEY_KERN),
 	FUSE_OPT_KEY("max_read=",		KEY_KERN),
 	FUSE_OPT_KEY("subtype=",		KEY_KERN),
