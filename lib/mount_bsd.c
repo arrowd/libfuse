@@ -25,6 +25,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
+#include <sys/user.h>
+#include <sys/sysctl.h>
 
 #define FUSERMOUNT_PROG		"mount_fusefs"
 #define FUSE_DEV_TRUNK		"/dev/fuse"
@@ -38,6 +40,7 @@ struct mount_opts {
 	int allow_other;
 	char *kernel_opts;
 	unsigned max_read;
+	int auto_unmount;
 };
 
 #define FUSE_DUAL_OPT_KEY(templ, key)				\
@@ -46,6 +49,7 @@ struct mount_opts {
 static const struct fuse_opt fuse_mount_opts[] = {
 	{ "allow_other", offsetof(struct mount_opts, allow_other), 1 },
 	{ "max_read=%u", offsetof(struct mount_opts, max_read), 1 },
+	{ "auto_unmount", offsetof(struct mount_opts, auto_unmount), 1 },
 	FUSE_OPT_KEY("-r",			KEY_RO),
 	/* standard FreeBSD mount options */
 	FUSE_DUAL_OPT_KEY("dev",		KEY_KERN),
@@ -103,6 +107,60 @@ unsigned get_max_read(struct mount_opts *o)
 	return o->max_read;
 }
 
+static int resolve_pid(pid_t pid, struct kinfo_proc *out)
+{
+	int mib[4];
+	size_t size = sizeof(struct kinfo_proc);
+
+	mib[0] = CTL_KERN;
+	mib[1] = KERN_PROC;
+	mib[2] = KERN_PROC_PID;
+	mib[3] = pid;
+	return sysctl(mib, 4, out, &size, NULL, 0);
+}
+
+static void start_auto_unmounter(const char *mountpoint,
+			       struct kinfo_proc *client_kproc)
+{
+	const char *mountprog = "/usr/obj/usr/src/amd64.amd64/sbin/mount_fusefs/mount_fusefs";
+	int pid = rfork(RFCFDG | RFPROC | RFNOWAIT);
+
+	if (pid == -1) {
+		perror("fuse: rfork() failed");
+		return;
+	}
+
+	if (pid == 0) {
+		struct statfs stat_buf;
+		char auto_unmount_arg[128];
+		const char *argv[32];
+		int a = 0;
+		close(0);
+
+		if (statfs(mountpoint, &stat_buf) != 0) {
+			/* It is unlikely that we get there, but if we do, what should we do?
+			 * Unmount the FS, because we can't fulfill the auto-unmount promise,
+			 * or let the caller proceed?
+			 */
+			perror("fuse: failed to setup auto-unmount due to statfs error");
+			_exit(EXIT_FAILURE);
+		}
+		snprintf(auto_unmount_arg, sizeof(auto_unmount_arg), "%d,%ld,%ld,%d,%d",
+			client_kproc->ki_pid, client_kproc->ki_start.tv_sec,
+			client_kproc->ki_start.tv_usec, stat_buf.f_fsid.val[0], stat_buf.f_fsid.val[1]);
+
+		argv[a++] = mountprog;
+		argv[a++] = "--auto-unmount";
+		argv[a++] = auto_unmount_arg;
+		argv[a++] = "whatever";
+		argv[a++] = mountpoint;
+		argv[a++] = NULL;
+		execvp(mountprog, (char **) argv);
+		perror("fuse: failed to exec auto-unmount program");
+		_exit(EXIT_FAILURE);
+	}
+}
+
 static int fuse_mount_opt_proc(void *data, const char *arg, int key,
 			       struct fuse_args *outargs)
 {
@@ -131,9 +189,10 @@ void fuse_kern_unmount(const char *mountpoint, int fd)
 			mountpoint, strerror(errno));
 }
 
-static int fuse_mount_core(const char *mountpoint, const char *opts)
+static int fuse_mount_core(const char *mountpoint, const char *opts, int auto_unmount)
 {
 	const char *mountprog = FUSERMOUNT_PROG;
+	struct kinfo_proc client_kproc;
 	long fd;
 	char *fdnam, *dev;
 	pid_t pid, cpid;
@@ -165,6 +224,12 @@ static int fuse_mount_core(const char *mountpoint, const char *opts)
 mount:
 	if (getenv("FUSE_NO_MOUNT") || ! mountpoint)
 		goto out;
+
+	if (resolve_pid(getpid(), &client_kproc)) {
+		perror("fuse: failed to lookup process information");
+		close(fd);
+		return -1;
+	}
 
 	pid = fork();
 	cpid = pid;
@@ -201,9 +266,22 @@ mount:
 			}
 
 			argv[a++] = mountprog;
-			if (opts) {
+			if (opts && !auto_unmount) {
 				argv[a++] = "-o";
 				argv[a++] = opts;
+			} else if (!opts && auto_unmount) {
+				/* if client wants auto_unmount we pass nocover to help
+				 * mount_fusefs fulfill its unmounting promise
+				 */
+				argv[a++] = "-o";
+				argv[a++] = "nocover";
+			} else if (opts && auto_unmount) {
+				static const char nocover_opt[] = ",nocover";
+				int optslen = strlen(opts);
+				argv[a++] = "-o";
+				argv[a++] = malloc(optslen + sizeof(nocover_opt) + 1);
+				strcpy(__DECONST(char*, argv[a-1]), opts);
+				strcpy(__DECONST(char*, argv[a-1] + optslen), nocover_opt);
 			}
 			argv[a++] = fdnam;
 			argv[a++] = mountpoint;
@@ -217,6 +295,10 @@ mount:
 		waitpid(pid, &status, 0);
 		if (!WIFEXITED(status))
 			_exit(EXIT_FAILURE);
+
+		if (auto_unmount)
+			start_auto_unmounter(mountpoint, &client_kproc);
+
 		_exit(WEXITSTATUS(status));
 	}
 
@@ -265,5 +347,5 @@ int fuse_kern_mount(const char *mountpoint, struct mount_opts *mo)
 	/* to notify the mount util it's called from lib */
 	setenv("MOUNT_FUSEFS_CALL_BY_LIB", "1", 1);
 
-	return fuse_mount_core(mountpoint, mo->kernel_opts);
+	return fuse_mount_core(mountpoint, mo->kernel_opts, mo->auto_unmount);
 }
