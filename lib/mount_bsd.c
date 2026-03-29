@@ -17,6 +17,7 @@
 #include <sys/param.h>
 #include "fuse_mount_compat.h"
 
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,11 +126,60 @@ static int fuse_mount_opt_proc(void *data, const char *arg, int key,
 
 void fuse_kern_unmount(const char *mountpoint, int fd)
 {
+	int usermount_sysctl;
+	size_t usermount_sysctl_size = sizeof(usermount_sysctl);
+	int usermount = getuid() != 0;
+
+	if (sysctlbyname("vfs.usermount", &usermount_sysctl,
+		&usermount_sysctl_size, NULL, 0) == 0) {
+		/* There is no point in usermount mode if vfs.usermount=1 */
+		if (usermount_sysctl)
+			usermount = 0;
+	}
+
 	if (close(fd) < 0)
 		fuse_log(FUSE_LOG_ERR, "closing FD %d failed: %s", fd, strerror(errno));
-	if (unmount(mountpoint, MNT_FORCE) < 0)
-		fuse_log(FUSE_LOG_ERR, "unmounting %s failed: %s",
-			mountpoint, strerror(errno));
+
+	if (usermount) {
+		int status;
+		pid_t pid;
+
+		pid = fork();
+
+		if (pid == -1) {
+			perror("fuse: fork() failed");
+			return;
+		}
+
+		if (pid == 0) {
+			const char *argv[4];
+			int a = 0;
+
+			argv[a++] = FUSERMOUNT_PROG;
+			argv[a++] = "-u";
+			argv[a++] = mountpoint;
+			argv[a++] = NULL;
+			execvp(FUSERMOUNT_PROG, (char **) argv);
+			perror("fuse: failed to exec unmount program");
+			_exit(EXIT_FAILURE);
+		}
+
+		if (waitpid(pid, &status, 0) == -1 || WEXITSTATUS(status) != 0)
+			fuse_log(FUSE_LOG_ERR, "unmounting %s via mount_fusefs failed",
+				mountpoint);
+	}
+	else {
+		/* FIXME: there might a problem when we're running as root, but with
+		 * auto_unmount. The actual unmounting happens above when we
+		 * call close(fd). Trying to call unmount() here might unmount something
+		 * else. We should somehow save fsid in fuse_kern_mount() and perform
+		 * the unmounting by id
+		 */
+		if (unmount(mountpoint, MNT_FORCE) < 0) {
+			fuse_log(FUSE_LOG_ERR, "unmounting %s failed: %s",
+				mountpoint, strerror(errno));
+		}
+	}
 }
 
 static int fuse_mount_core(const char *mountpoint, const char *opts)
